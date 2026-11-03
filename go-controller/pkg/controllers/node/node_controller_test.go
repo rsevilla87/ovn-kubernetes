@@ -5,7 +5,10 @@ package node
 
 import (
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -482,5 +485,110 @@ func TestReconcileNodeDeleteCacheMissStillClearsState(t *testing.T) {
 	}
 	if c.nodeNeedsDeleteReconciliation(handler.netName, "node-a") {
 		t.Fatal("expected delete reconciliation marker to be cleared")
+	}
+}
+
+// bootstrapQueueOrderForTest registers a handler for netName on a NodeController for nodeName and
+// returns the queue keys in the order a single worker dequeues them.
+func bootstrapQueueOrderForTest(t *testing.T, nodeName, netName string, nodes []*corev1.Node) []string {
+	t.Helper()
+	var mu sync.Mutex
+	var keys []string
+	done := make(chan struct{})
+	nodeController := controller.NewController("topology-test-node-controller", &controller.ControllerConfig[corev1.Node]{
+		RateLimiter: workqueue.DefaultTypedControllerRateLimiter[string](),
+		Reconcile: func(_ context.Context, key string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			keys = append(keys, key)
+			if len(keys) == len(nodes) {
+				close(done)
+			}
+			return nil
+		},
+		// A single worker dequeues keys in the order they were added.
+		Threadiness:    1,
+		Lister:         func(labels.Selector) ([]*corev1.Node, error) { return nil, nil },
+		ObjNeedsUpdate: func(_, _ *corev1.Node) bool { return true },
+	})
+	c := &NodeController{
+		name:               "topology-test",
+		nodeName:           nodeName,
+		networkManager:     networkmanager.Default().Interface(),
+		nodeController:     nodeController,
+		nodeLister:         newNodeLister(t, nodes...),
+		handlers:           syncmap.NewSyncMap[NodeHandler](),
+		nodeReconciliation: map[string]map[string]bool{},
+		nodeActive:         map[string]map[string]struct{}{},
+		nodeCache:          map[string]map[string]*corev1.Node{},
+		annotationCache:    NewNodeAnnotationCache(),
+	}
+
+	// Keys are queued here, before any worker runs.
+	if err := c.RegisterNetworkController(&fakeNodeHandler{netName: netName}); err != nil {
+		t.Fatalf("unexpected register error: %v", err)
+	}
+	if err := controller.Start(nodeController); err != nil {
+		t.Fatalf("failed to start node controller: %v", err)
+	}
+	defer controller.Stop(nodeController)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		mu.Lock()
+		defer mu.Unlock()
+		t.Fatalf("timed out waiting for %d keys, got %d", len(nodes), len(keys))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]string(nil), keys...)
+}
+
+func testNodes(count int) []*corev1.Node {
+	nodes := make([]*corev1.Node, 0, count)
+	for i := 0; i < count; i++ {
+		nodes = append(nodes, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("node-%04d", i)}})
+	}
+	return nodes
+}
+
+func TestBootstrapNetworkQueuesLocalNodeFirst(t *testing.T) {
+	const netName = "net-a"
+	nodes := testNodes(500)
+	// Pick a node that the lister is unlikely to return first.
+	localNode := nodes[len(nodes)-1].Name
+
+	keys := bootstrapQueueOrderForTest(t, localNode, netName, nodes)
+
+	if len(keys) != len(nodes) {
+		t.Fatalf("expected %d queued keys, got %d", len(nodes), len(keys))
+	}
+	if want := scopedNodeQueueKey(localNode, netName); keys[0] != want {
+		t.Fatalf("expected the local node to be queued first (%q), got %q", want, keys[0])
+	}
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if _, dup := seen[key]; dup {
+			t.Fatalf("key %q queued more than once", key)
+		}
+		seen[key] = struct{}{}
+	}
+	for _, node := range nodes {
+		if _, ok := seen[scopedNodeQueueKey(node.Name, netName)]; !ok {
+			t.Fatalf("node %q was not queued", node.Name)
+		}
+	}
+}
+
+func TestBootstrapNetworkQueuesAllNodesWithoutLocalNode(t *testing.T) {
+	const netName = "net-a"
+	nodes := testNodes(50)
+
+	for _, nodeName := range []string{"", "not-in-the-cluster"} {
+		keys := bootstrapQueueOrderForTest(t, nodeName, netName, nodes)
+		if len(keys) != len(nodes) {
+			t.Fatalf("nodeName %q: expected %d queued keys, got %d", nodeName, len(nodes), len(keys))
+		}
 	}
 }

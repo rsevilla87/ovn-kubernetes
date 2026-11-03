@@ -386,7 +386,21 @@ func (c *NodeController) bootstrapNetwork(netName string, handler NodeHandler) e
 	}
 
 	c.setBootstrapNodes(netName, nodes)
+	// Enqueue the local node ahead of every other node. Network controllers wait for the local
+	// node to be reconciled before they finish starting (see waitForInitialNodeSync), while the
+	// lister returns nodes in no particular order. Without this, the local node can end up behind
+	// thousands of remote nodes in large clusters and the start-up wait times out.
+	localNodeQueued := false
+	if c.nodeName != "" {
+		if _, err := c.nodeLister.Get(c.nodeName); err == nil {
+			c.nodeController.Reconcile(scopedNodeQueueKey(c.nodeName, netName))
+			localNodeQueued = true
+		}
+	}
 	for _, node := range nodes {
+		if localNodeQueued && node.Name == c.nodeName {
+			continue
+		}
 		c.nodeController.Reconcile(scopedNodeQueueKey(node.Name, netName))
 	}
 	return nil
