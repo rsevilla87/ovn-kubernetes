@@ -497,7 +497,7 @@ func bootstrapQueueOrderForTest(t *testing.T, nodeName, netName string, nodes []
 	done := make(chan struct{})
 	nodeController := controller.NewController("topology-test-node-controller", &controller.ControllerConfig[corev1.Node]{
 		RateLimiter: workqueue.DefaultTypedControllerRateLimiter[string](),
-		Reconcile: func(_ context.Context, key string) error {
+		Reconcile: func(key string) error {
 			mu.Lock()
 			defer mu.Unlock()
 			keys = append(keys, key)
