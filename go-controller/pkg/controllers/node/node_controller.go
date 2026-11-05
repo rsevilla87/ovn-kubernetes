@@ -12,7 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/listers/core/v1"
+	v1 "k8s.io/client-go/listers/core/v1"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
@@ -188,7 +188,6 @@ func (c *NodeController) RegisterNetworkController(handler NodeHandler) error {
 		if existing, ok := c.handlers.Load(key); ok && existing != nil {
 			panic(fmt.Sprintf("%s: duplicate node handler registration for network %q", c.name, key))
 		}
-		c.handlers.Store(key, handler)
 		if err := c.bootstrapNetwork(key, handler); err != nil {
 			c.handlers.Delete(key)
 			return fmt.Errorf("%s: failed to bootstrap network %s: %w", c.name, netName, err)
@@ -381,11 +380,6 @@ func (c *NodeController) bootstrapNetwork(netName string, handler NodeHandler) e
 	if err != nil {
 		return err
 	}
-	if err := handler.SyncNodes(nodes); err != nil {
-		return err
-	}
-
-	c.setBootstrapNodes(netName, nodes)
 	// Enqueue the local node ahead of every other node. Network controllers wait for the local
 	// node to be reconciled before they finish starting (see waitForInitialNodeSync), while the
 	// lister returns nodes in no particular order. Without this, the local node can end up behind
@@ -397,6 +391,19 @@ func (c *NodeController) bootstrapNetwork(netName string, handler NodeHandler) e
 			localNodeQueued = true
 		}
 	}
+	// The handler must be visible before the potentially long SyncNodes call. Unscoped node events
+	// fan out over the registered handlers without taking the per-network lock; if this network were
+	// missing they would skip it, and since informer resync is disabled, nodes created after the
+	// initial list above would never be queued for it. Doing this after queuing the local node keeps
+	// the local node ahead of any remote node queued by such events. Workers that dequeue a key for
+	// this network block on the per-network lock held by the caller until bootstrap completes.
+	c.handlers.Store(netName, handler)
+
+	if err := handler.SyncNodes(nodes); err != nil {
+		return err
+	}
+
+	c.setBootstrapNodes(netName, nodes)
 	for _, node := range nodes {
 		if localNodeQueued && node.Name == c.nodeName {
 			continue
