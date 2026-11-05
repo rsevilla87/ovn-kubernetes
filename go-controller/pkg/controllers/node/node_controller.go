@@ -45,8 +45,12 @@ type NodeController struct {
 	nodeName string
 
 	nodeController controller.Controller
-	networkManager networkmanager.Interface
-	nodeLister     v1.NodeLister
+	// localNodeController reconciles this process's own node. It is a separate
+	// single-worker queue so that node is not stuck behind remote nodes queued
+	// for other networks. Nil when nodeName is empty (cluster manager).
+	localNodeController controller.Reconciler
+	networkManager      networkmanager.Interface
+	nodeLister          v1.NodeLister
 
 	// handlers maps network name to node handler.
 	handlers *syncmap.SyncMap[NodeHandler]
@@ -122,6 +126,13 @@ func NewNodeController(wf *factory.WatchFactory, networkManager networkmanager.I
 	}
 	c := NewController(wf, "node-topology", networkManager)
 	c.nodeName = nodeName
+	// Retries stay on this queue because it runs reconcileNode itself, rather than
+	// handing the key back to the shared remote-node queue.
+	c.localNodeController = controller.NewReconciler(c.name+"-local-node", &controller.ReconcilerConfig{
+		Reconcile:   c.reconcileNode,
+		Threadiness: 1,
+		MaxAttempts: controller.InfiniteAttempts,
+	})
 	return c
 }
 
@@ -133,8 +144,14 @@ func (c *NodeController) Start() error {
 		return nil
 	}
 
-	err := controller.Start(c.nodeController)
-	if err != nil {
+	// One Start call so a failure stops every queue this call started. Separate
+	// calls would drop the shared queue's error when the local queue starts, and
+	// would leave the shared workers running when the local queue fails.
+	reconcilers := []controller.Reconciler{c.nodeController}
+	if c.localNodeController != nil {
+		reconcilers = append(reconcilers, c.localNodeController)
+	}
+	if err := controller.Start(reconcilers...); err != nil {
 		return err
 	}
 
@@ -148,11 +165,21 @@ func (c *NodeController) Stop() {
 	c.started = false
 	c.startMu.Unlock()
 	controller.Stop(c.nodeController)
+	if c.localNodeController != nil {
+		controller.Stop(c.localNodeController)
+	}
 }
 
 // ReconcileNetwork queues reconciliation for a single node/network pair.
+// The controller's own node goes to the dedicated local queue so startup waits
+// (waitForInitialNodeSync, waitForLocalZoneNodeLogicalSwitches) are not blocked
+// by remote nodes already queued for other networks.
 func (c *NodeController) ReconcileNetwork(nodeName, netName string) {
-	c.nodeController.Reconcile(scopedNodeQueueKey(nodeName, netName))
+	var reconciler controller.Reconciler = c.nodeController
+	if c.localNodeController != nil && nodeName == c.nodeName {
+		reconciler = c.localNodeController
+	}
+	reconciler.Reconcile(scopedNodeQueueKey(nodeName, netName))
 }
 
 // ReconcileNetworkWithPreflight runs preflight against the network handler and
@@ -380,23 +407,11 @@ func (c *NodeController) bootstrapNetwork(netName string, handler NodeHandler) e
 	if err != nil {
 		return err
 	}
-	// Enqueue the local node ahead of every other node. Network controllers wait for the local
-	// node to be reconciled before they finish starting (see waitForInitialNodeSync), while the
-	// lister returns nodes in no particular order. Without this, the local node can end up behind
-	// thousands of remote nodes in large clusters and the start-up wait times out.
-	localNodeQueued := false
-	if c.nodeName != "" {
-		if _, err := c.nodeLister.Get(c.nodeName); err == nil {
-			c.nodeController.Reconcile(scopedNodeQueueKey(c.nodeName, netName))
-			localNodeQueued = true
-		}
-	}
 	// The handler must be visible before the potentially long SyncNodes call. Unscoped node events
 	// fan out over the registered handlers without taking the per-network lock; if this network were
 	// missing they would skip it, and since informer resync is disabled, nodes created after the
-	// initial list above would never be queued for it. Doing this after queuing the local node keeps
-	// the local node ahead of any remote node queued by such events. Workers that dequeue a key for
-	// this network block on the per-network lock held by the caller until bootstrap completes.
+	// initial list above would never be queued for it. Workers that dequeue a key for this network
+	// block on the per-network lock held by the caller until bootstrap completes.
 	c.handlers.Store(netName, handler)
 
 	if err := handler.SyncNodes(nodes); err != nil {
@@ -405,10 +420,7 @@ func (c *NodeController) bootstrapNetwork(netName string, handler NodeHandler) e
 
 	c.setBootstrapNodes(netName, nodes)
 	for _, node := range nodes {
-		if localNodeQueued && node.Name == c.nodeName {
-			continue
-		}
-		c.nodeController.Reconcile(scopedNodeQueueKey(node.Name, netName))
+		c.ReconcileNetwork(node.Name, netName)
 	}
 	return nil
 }

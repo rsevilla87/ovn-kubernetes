@@ -118,6 +118,62 @@ func TestNodeControllerStartFailure(t *testing.T) {
 	}
 }
 
+func TestNodeControllerStartFailureRollsBackBothQueues(t *testing.T) {
+	tests := []struct {
+		name              string
+		sharedThreadiness int
+		localThreadiness  int
+	}{
+		{name: "shared queue", sharedThreadiness: 0, localThreadiness: 1},
+		{name: "local queue", sharedThreadiness: 1, localThreadiness: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sharedRan := make(chan struct{}, 1)
+			localRan := make(chan struct{}, 1)
+			c := &NodeController{
+				name:           "topology-test",
+				networkManager: networkmanager.Default().Interface(),
+				nodeController: controller.NewController("topology-test-node-controller-"+tt.name, &controller.ControllerConfig[corev1.Node]{
+					RateLimiter:    workqueue.DefaultTypedControllerRateLimiter[string](),
+					Reconcile:      func(string) error { sharedRan <- struct{}{}; return nil },
+					Threadiness:    tt.sharedThreadiness,
+					Lister:         func(labels.Selector) ([]*corev1.Node, error) { return nil, nil },
+					ObjNeedsUpdate: func(_, _ *corev1.Node) bool { return true },
+				}),
+				localNodeController: controller.NewReconciler("topology-test-local-node-"+tt.name, &controller.ReconcilerConfig{
+					RateLimiter: workqueue.DefaultTypedControllerRateLimiter[string](),
+					Reconcile:   func(string) error { localRan <- struct{}{}; return nil },
+					Threadiness: tt.localThreadiness,
+				}),
+				handlers:           syncmap.NewSyncMap[NodeHandler](),
+				nodeReconciliation: map[string]map[string]bool{},
+				nodeActive:         map[string]map[string]struct{}{},
+				nodeCache:          map[string]map[string]*corev1.Node{},
+				annotationCache:    NewNodeAnnotationCache(),
+			}
+
+			err := c.Start()
+			if err == nil {
+				t.Fatal("expected Start to fail")
+			}
+			if c.started {
+				t.Fatal("expected controller to remain not-started on Start failure")
+			}
+
+			c.nodeController.Reconcile("node-a|net-a")
+			c.localNodeController.Reconcile("node-a|net-a")
+			select {
+			case <-sharedRan:
+				t.Fatal("shared queue reconciled after Start failure")
+			case <-localRan:
+				t.Fatal("local queue reconciled after Start failure")
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
+	}
+}
+
 func TestRegisterNetworkControllerBootstrapFailure(t *testing.T) {
 	handler := &fakeNodeHandler{
 		netName: "net-a",
@@ -488,25 +544,26 @@ func TestReconcileNodeDeleteCacheMissStillClearsState(t *testing.T) {
 	}
 }
 
-// bootstrapQueueOrderForTest registers a handler for netName on a NodeController for nodeName and
-// returns the queue keys in the order a single worker dequeues them.
-func bootstrapQueueOrderForTest(t *testing.T, nodeName, netName string, nodes []*corev1.Node) []string {
+// bootstrapQueuedKeysForTest registers a handler for netName and returns the keys dequeued by the
+// shared remote queue and, when nodeName is one of nodes, the dedicated local queue.
+func bootstrapQueuedKeysForTest(t *testing.T, nodeName, netName string, nodes []*corev1.Node) (remoteKeys, localKeys []string) {
 	t.Helper()
 	var mu sync.Mutex
-	var keys []string
 	done := make(chan struct{})
-	nodeController := controller.NewController("topology-test-node-controller", &controller.ControllerConfig[corev1.Node]{
-		RateLimiter: workqueue.DefaultTypedControllerRateLimiter[string](),
-		Reconcile: func(key string) error {
+	record := func(dst *[]string) func(string) error {
+		return func(key string) error {
 			mu.Lock()
 			defer mu.Unlock()
-			keys = append(keys, key)
-			if len(keys) == len(nodes) {
+			*dst = append(*dst, key)
+			if len(remoteKeys)+len(localKeys) == len(nodes) {
 				close(done)
 			}
 			return nil
-		},
-		// A single worker dequeues keys in the order they were added.
+		}
+	}
+	nodeController := controller.NewController("topology-test-node-controller", &controller.ControllerConfig[corev1.Node]{
+		RateLimiter:    workqueue.DefaultTypedControllerRateLimiter[string](),
+		Reconcile:      record(&remoteKeys),
 		Threadiness:    1,
 		Lister:         func(labels.Selector) ([]*corev1.Node, error) { return nil, nil },
 		ObjNeedsUpdate: func(_, _ *corev1.Node) bool { return true },
@@ -523,26 +580,44 @@ func bootstrapQueueOrderForTest(t *testing.T, nodeName, netName string, nodes []
 		nodeCache:          map[string]map[string]*corev1.Node{},
 		annotationCache:    NewNodeAnnotationCache(),
 	}
+	reconcilers := []controller.Reconciler{nodeController}
+	if nodeListed(nodeName, nodes) {
+		c.localNodeController = controller.NewReconciler("topology-test-local-node", &controller.ReconcilerConfig{
+			RateLimiter: workqueue.DefaultTypedControllerRateLimiter[string](),
+			Reconcile:   record(&localKeys),
+			Threadiness: 1,
+		})
+		reconcilers = append(reconcilers, c.localNodeController)
+	}
 
 	// Keys are queued here, before any worker runs.
 	if err := c.RegisterNetworkController(&fakeNodeHandler{netName: netName}); err != nil {
 		t.Fatalf("unexpected register error: %v", err)
 	}
-	if err := controller.Start(nodeController); err != nil {
+	if err := controller.Start(reconcilers...); err != nil {
 		t.Fatalf("failed to start node controller: %v", err)
 	}
-	defer controller.Stop(nodeController)
+	defer controller.Stop(reconcilers...)
 
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		mu.Lock()
 		defer mu.Unlock()
-		t.Fatalf("timed out waiting for %d keys, got %d", len(nodes), len(keys))
+		t.Fatalf("timed out waiting for %d keys, got %d remote and %d local", len(nodes), len(remoteKeys), len(localKeys))
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	return append([]string(nil), keys...)
+	return append([]string(nil), remoteKeys...), append([]string(nil), localKeys...)
+}
+
+func nodeListed(nodeName string, nodes []*corev1.Node) bool {
+	for _, node := range nodes {
+		if node.Name == nodeName {
+			return true
+		}
+	}
+	return false
 }
 
 func testNodes(count int) []*corev1.Node {
@@ -553,31 +628,96 @@ func testNodes(count int) []*corev1.Node {
 	return nodes
 }
 
-func TestBootstrapNetworkQueuesLocalNodeFirst(t *testing.T) {
+func TestBootstrapNetworkQueuesLocalNodeSeparately(t *testing.T) {
 	const netName = "net-a"
-	nodes := testNodes(500)
-	// Pick a node that the lister is unlikely to return first.
+	nodes := testNodes(50)
 	localNode := nodes[len(nodes)-1].Name
 
-	keys := bootstrapQueueOrderForTest(t, localNode, netName, nodes)
+	remoteKeys, localKeys := bootstrapQueuedKeysForTest(t, localNode, netName, nodes)
 
-	if len(keys) != len(nodes) {
-		t.Fatalf("expected %d queued keys, got %d", len(nodes), len(keys))
+	if len(localKeys) != 1 || localKeys[0] != scopedNodeQueueKey(localNode, netName) {
+		t.Fatalf("expected only the local node on the local queue, got %q", localKeys)
 	}
-	if want := scopedNodeQueueKey(localNode, netName); keys[0] != want {
-		t.Fatalf("expected the local node to be queued first (%q), got %q", want, keys[0])
+	if len(remoteKeys) != len(nodes)-1 {
+		t.Fatalf("expected %d remote keys, got %d", len(nodes)-1, len(remoteKeys))
 	}
-	seen := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
+	seen := make(map[string]struct{}, len(remoteKeys))
+	for _, key := range remoteKeys {
+		if key == localKeys[0] {
+			t.Fatalf("local node %q was also queued on the remote queue", key)
+		}
 		if _, dup := seen[key]; dup {
 			t.Fatalf("key %q queued more than once", key)
 		}
 		seen[key] = struct{}{}
 	}
-	for _, node := range nodes {
+	for _, node := range nodes[:len(nodes)-1] {
 		if _, ok := seen[scopedNodeQueueKey(node.Name, netName)]; !ok {
 			t.Fatalf("node %q was not queued", node.Name)
 		}
+	}
+}
+
+func TestLocalNodeQueueRunsWhileRemoteQueueIsBlocked(t *testing.T) {
+	const netName = "net-a"
+	nodes := testNodes(20)
+	localNode := nodes[len(nodes)-1].Name
+
+	remoteStarted := make(chan struct{})
+	releaseRemote := make(chan struct{})
+	var once sync.Once
+	nodeController := controller.NewController("topology-test-node-controller-blocked", &controller.ControllerConfig[corev1.Node]{
+		RateLimiter: workqueue.DefaultTypedControllerRateLimiter[string](),
+		Reconcile: func(string) error {
+			once.Do(func() { close(remoteStarted) })
+			<-releaseRemote
+			return nil
+		},
+		Threadiness:    1,
+		Lister:         func(labels.Selector) ([]*corev1.Node, error) { return nil, nil },
+		ObjNeedsUpdate: func(_, _ *corev1.Node) bool { return true },
+	})
+	localDone := make(chan string, 1)
+	localController := controller.NewReconciler("topology-test-local-node-blocked", &controller.ReconcilerConfig{
+		RateLimiter: workqueue.DefaultTypedControllerRateLimiter[string](),
+		Reconcile: func(key string) error {
+			localDone <- key
+			return nil
+		},
+		Threadiness: 1,
+	})
+	c := &NodeController{
+		name:                "topology-test",
+		nodeName:            localNode,
+		networkManager:      networkmanager.Default().Interface(),
+		nodeController:      nodeController,
+		localNodeController: localController,
+		nodeLister:          newNodeLister(t, nodes...),
+		handlers:            syncmap.NewSyncMap[NodeHandler](),
+		nodeReconciliation:  map[string]map[string]bool{},
+		nodeActive:          map[string]map[string]struct{}{},
+		nodeCache:           map[string]map[string]*corev1.Node{},
+		annotationCache:     NewNodeAnnotationCache(),
+	}
+
+	if err := c.RegisterNetworkController(&fakeNodeHandler{netName: netName}); err != nil {
+		t.Fatalf("unexpected register error: %v", err)
+	}
+	if err := controller.Start(nodeController, localController); err != nil {
+		t.Fatalf("failed to start node controller: %v", err)
+	}
+	defer func() {
+		close(releaseRemote)
+		controller.Stop(nodeController, localController)
+	}()
+
+	select {
+	case key := <-localDone:
+		if want := scopedNodeQueueKey(localNode, netName); key != want {
+			t.Fatalf("expected local queue to reconcile %q, got %q", want, key)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("local node was not reconciled while the remote queue was blocked")
 	}
 }
 
@@ -586,9 +726,12 @@ func TestBootstrapNetworkQueuesAllNodesWithoutLocalNode(t *testing.T) {
 	nodes := testNodes(50)
 
 	for _, nodeName := range []string{"", "not-in-the-cluster"} {
-		keys := bootstrapQueueOrderForTest(t, nodeName, netName, nodes)
-		if len(keys) != len(nodes) {
-			t.Fatalf("nodeName %q: expected %d queued keys, got %d", nodeName, len(nodes), len(keys))
+		remoteKeys, localKeys := bootstrapQueuedKeysForTest(t, nodeName, netName, nodes)
+		if len(localKeys) != 0 {
+			t.Fatalf("nodeName %q: expected no local queue, got %q", nodeName, localKeys)
+		}
+		if len(remoteKeys) != len(nodes) {
+			t.Fatalf("nodeName %q: expected %d queued keys, got %d", nodeName, len(nodes), len(remoteKeys))
 		}
 	}
 }
